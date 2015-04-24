@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	appNameRegex string = `([a-z0-9-]+)_v([1-9][0-9]*).(cmd|web).([1-9][0-9])*`
+	appNameRegex    string = `([a-z0-9-]+)_v([1-9][0-9]*).(cmd|web).([1-9][0-9])*`
+	defaultLogLevel string = "error"
 )
 
 // Server is the main entrypoint for a publisher. It listens on a docker client for events
@@ -23,6 +24,8 @@ const (
 type Server struct {
 	DockerClient *docker.Client
 	EtcdClient   *etcd.Client
+
+	logLevel string
 }
 
 var safeMap = struct {
@@ -39,8 +42,12 @@ func (s *Server) Listen(ttl time.Duration) {
 	if err := s.DockerClient.AddEventListener(listener); err != nil {
 		log.Fatal(err)
 	}
+	t := time.NewTicker(time.Minute)
+	s.loadSettings()
 	for {
 		select {
+		case <-t.C:
+			s.loadSettings()
 		case event := <-listener:
 			if event.Status == "start" {
 				container, err := s.getContainer(event.ID)
@@ -65,6 +72,16 @@ func (s *Server) Poll(ttl time.Duration) {
 	for _, container := range containers {
 		// send container to channel for processing
 		s.publishContainer(&container, ttl)
+	}
+}
+
+// loadSettings loads all of the settings from Etcd.
+func (s *Server) loadSettings() {
+	response, err := s.EtcdClient.Get("/deis/publisher/logLevel", false, false)
+	if err == nil {
+		s.logLevel = response.Node.Value
+	} else {
+		s.logLevel = defaultLogLevel
 	}
 }
 
@@ -208,7 +225,9 @@ func (s *Server) setEtcd(key, value string, ttl uint64) {
 	if _, err := s.EtcdClient.Set(key, value, ttl); err != nil {
 		log.Println(err)
 	}
-	log.Println("set", key, "->", value)
+	if s.logLevel == "debug" {
+		log.Printf("set %q -> %q. ttl: %d", key, value, ttl)
+	}
 }
 
 // removeEtcd removes the corresponding etcd key
@@ -216,7 +235,9 @@ func (s *Server) removeEtcd(key string, recursive bool) {
 	if _, err := s.EtcdClient.Delete(key, recursive); err != nil {
 		log.Println(err)
 	}
-	log.Println("del", key)
+	if s.logLevel == "debug" {
+		log.Printf("remove %q. recursive: %t", key, recursive)
+	}
 }
 
 // updateDir updates the given directory for a given ttl. It succeeds
@@ -225,5 +246,7 @@ func (s *Server) updateDir(directory string, ttl uint64) {
 	if _, err := s.EtcdClient.UpdateDir(directory, ttl); err != nil {
 		log.Println(err)
 	}
-	log.Println("updateDir", directory)
+	if s.logLevel == "debug" {
+		log.Printf("updateDir %q. ttl: %d", directory, ttl)
+	}
 }
