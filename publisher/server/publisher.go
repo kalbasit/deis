@@ -25,6 +25,7 @@ type Server struct {
 	DockerClient *docker.Client
 	EtcdClient   *etcd.Client
 
+	mu       sync.RWMutex
 	logLevel string
 }
 
@@ -47,7 +48,7 @@ func (s *Server) Listen(ttl time.Duration) {
 	for {
 		select {
 		case <-t.C:
-			s.loadSettings()
+			go s.loadSettings()
 		case event := <-listener:
 			if event.Status == "start" {
 				container, err := s.getContainer(event.ID)
@@ -77,11 +78,41 @@ func (s *Server) Poll(ttl time.Duration) {
 
 // loadSettings loads all of the settings from Etcd.
 func (s *Server) loadSettings() {
-	response, err := s.EtcdClient.Get("/deis/publisher/logLevel", false, false)
-	if err == nil {
-		s.logLevel = response.Node.Value
-	} else {
-		s.logLevel = defaultLogLevel
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	logLevel := make(chan string)
+	go func() {
+		defer wg.Done()
+
+		var res string
+		response, err := s.EtcdClient.Get("/deis/publisher/logLevel", false, false)
+		if err == nil {
+			res = response.Node.Value
+		} else {
+			res = defaultLogLevel
+		}
+
+		select {
+		case logLevel <- res:
+			close(logLevel)
+		default:
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-time.After(10 * time.Second):
+	case ll := <-logLevel:
+		s.logLevel = ll
+	case <-done:
 	}
 }
 
@@ -220,14 +251,21 @@ func max(n []int) int {
 	return val
 }
 
+func (s *Server) debugF(format string, v ...interface{}) {
+	s.mu.RLock()
+	logLevel := s.logLevel
+	s.mu.Unlock()
+	if logLevel == "debug" {
+		log.Printf(format, v...)
+	}
+}
+
 // setEtcd sets the corresponding etcd key with the value and ttl
 func (s *Server) setEtcd(key, value string, ttl uint64) {
 	if _, err := s.EtcdClient.Set(key, value, ttl); err != nil {
 		log.Println(err)
 	}
-	if s.logLevel == "debug" {
-		log.Printf("set %q -> %q. ttl: %d", key, value, ttl)
-	}
+	s.debugF("set %q -> %q. ttl: %d", key, value, ttl)
 }
 
 // removeEtcd removes the corresponding etcd key
@@ -235,9 +273,7 @@ func (s *Server) removeEtcd(key string, recursive bool) {
 	if _, err := s.EtcdClient.Delete(key, recursive); err != nil {
 		log.Println(err)
 	}
-	if s.logLevel == "debug" {
-		log.Printf("remove %q. recursive: %t", key, recursive)
-	}
+	s.debugF("remove %q. recursive: %t", key, recursive)
 }
 
 // updateDir updates the given directory for a given ttl. It succeeds
@@ -246,7 +282,5 @@ func (s *Server) updateDir(directory string, ttl uint64) {
 	if _, err := s.EtcdClient.UpdateDir(directory, ttl); err != nil {
 		log.Println(err)
 	}
-	if s.logLevel == "debug" {
-		log.Printf("updateDir %q. ttl: %d", directory, ttl)
-	}
+	s.debugF("updateDir %q. ttl: %d", directory, ttl)
 }
